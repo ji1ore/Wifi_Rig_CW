@@ -104,13 +104,29 @@ WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
 int profileCount = 0;
 #ifdef LoadFromSource
 WiFiProfile defaultProfiles[] = {
-    {"UENO-a", "hogehoge33",
+    {"TEST-a", "testtest",
      IPAddress(192, 168, 1, 50), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0), true, false, &cyanProfile, "RKSERVER01"},
-    {"Ueno-mini1", "hogehoge33",
+    {"TEST-mini1", "testtest",
      IPAddress(172, 20, 10, 5), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), true, false, &MagentaProfile, "RKSERVER01"},
     {"RemoteKeyer-AP", "password123",
      IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0), true, true, &yellowProfile, "RKSERVER01"}};
 #endif
+
+// ==== EEPROMが空・SDカードなし時のフォールバック設定 ====
+// 環境に合わせてSSID/PASSを変更してください
+// サーバーWiFiProfile: ssid, password, localIP, gateway, subnet, hasIP, isApMode, color, hostname
+WiFiProfile fallbackProfile = {
+  "RemoteKeyer-AP",            // SSID (APのSSID)
+  "password123",               // パスワード
+  IPAddress(192, 168, 4, 1),   // ローカルIP (APとしての自IP)
+  IPAddress(192, 168, 4, 1),   // ゲートウェイ
+  IPAddress(255, 255, 255, 0), // サブネット
+  false,                       // hasIP: DHCP
+  true,                        // isApMode: APモード(ダイレクト接続)
+  &yellowProfile,              // LED色
+  "RKSERVER01"                 // ホスト名
+};
+const bool fallbackUsbMode = false; // true=USB中継モード / false=WiFiモード
 
 int activeProfileIndex = -1;
 
@@ -252,15 +268,16 @@ void setup()
     }
     // Serial.println("通常モード。EEPROMから復元します。");
   }
-  // ✅ EEPROMからプロファイルを復元
+  // ✅ EEPROMからプロファイルを復元（失敗時はフォールバック設定を使用）
   if (!restoreProfilesFromEEPROM())
   {
-
-    initLed();
-    while (true)
+    wifiProfiles[0]  = fallbackProfile;
+    profileCount     = 1;
+    selectedProfileIndex = 0;
+    if (fallbackUsbMode)
     {
-      flashOnce(&RedProfile, 300);
-      delay(300);
+      EEPROM.write(EEPROM_ADDR_USB_MODE, 1);
+      EEPROM.commit();
     }
   }
 #endif
@@ -912,7 +929,7 @@ bool loadWiFiProfilesFromSD()
   if (!file)
     return false;
 
-  WiFiProfile temp;
+  WiFiProfile temp = {};
   ColorProfile *color = &cyanProfile;
   profileCount = 0;
   bool hasData = false; // ← 追加！

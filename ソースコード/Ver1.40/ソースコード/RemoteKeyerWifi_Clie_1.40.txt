@@ -118,10 +118,27 @@ WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
 int profileCount = 0;
 #ifdef LoadFromSource
 WiFiProfile defaultProfiles[] = {
-    {"UENO-a", "hogehoge33", IPAddress(192, 168, 1, 51), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 1, 50), false, false, &cyanProfile, "RKCLIENT01", "RKSERVER01"},
-    {"Ueno-mini1", "hogehoge33", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5), false, false, &MagentaProfile, "RKCLIENT01", "RKSERVER01"},
+    {"TEST-a", "testtest", IPAddress(192, 168, 1, 51), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 1, 50), false, false, &cyanProfile, "RKCLIENT01", "RKSERVER01"},
+    {"Test-mini1", "testtest", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5), false, false, &MagentaProfile, "RKCLIENT01", "RKSERVER01"},
     {"RemoteKeyer-AP", "password123", IPAddress(192, 168, 4, 2), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 4, 1), true, false, &yellowProfile, "RKCLIENT01", "RKSERVER01"}};
 #endif
+
+// ==== EEPROMが空・SDカードなし時のフォールバック設定 ====
+// 環境に合わせてSSID/PASS/IPを変更してください
+WiFiProfile fallbackProfile = {
+  "RemoteKeyer-AP",            // SSID
+  "password123",               // パスワード
+  IPAddress(192, 168, 4, 2),   // ローカルIP
+  IPAddress(192, 168, 4, 1),   // ゲートウェイ
+  IPAddress(255, 255, 255, 0), // サブネット
+  IPAddress(192, 168, 4, 1),   // サーバーIP
+  true,                        // isApMode: ダイレクト(AP)接続
+  false,                       // hasIP: DHCP使用
+  &cyanProfile,                // LED色
+  "RKCLIENT01",                // クライアントホスト名
+  "RKSERVER01"                 // サーバーホスト名
+};
+const bool fallbackUsbMode = false; // true=USB中継モード / false=WiFiモード
 
 IPAddress serverIP;
 
@@ -311,64 +328,71 @@ void setup()
 
 #ifdef LoadFromSource
 #else
-  bool sdAvailable = false;
+  delay(100);
+  pinMode(SD_SPI_MISO_PIN, INPUT_PULLDOWN);
+  bool sdCardPresent = (digitalRead(SD_SPI_MISO_PIN) == HIGH);
   delay(500);
-  SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
 
-  if (SD.begin(SD_SPI_CS_PIN) && SD.exists(SD_Filename))
+  if (sdCardPresent)
   {
-    // Serial.println("SDカード初期化成功！");
-    if (loadWiFiProfilesFromSD())
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+    if (SD.begin(SD_SPI_CS_PIN) && SD.exists(SD_Filename))
     {
-      clearEEPROM();
-      for (int i = 0; i < profileCount; i++)
+      if (loadWiFiProfilesFromSD())
       {
-        saveWiFiProfileToEEPROM(wifiProfiles[i], i);
-      }
-      selectedProfileIndex = 0;
-      saveProfileIndexToEEPROM(0);
+        clearEEPROM();
+        for (int i = 0; i < profileCount; i++)
+        {
+          saveWiFiProfileToEEPROM(wifiProfiles[i], i);
+        }
+        selectedProfileIndex = 0;
+        saveProfileIndexToEEPROM(0);
 
-      SystemSettingsEEPROM sysSettings = {
-          0xA5,
-          keyRepeatCount,
-          SAMPLE_SEND_DUP_CNT,
-          SAMPLE_INTERVAL_MS,
-          SAMPLE_SEND_AMNT,
-          DEBOUNCE_US};
-      saveSystemSettingsToEEPROM(sysSettings);
+        SystemSettingsEEPROM sysSettings = {
+            0xA5,
+            keyRepeatCount,
+            SAMPLE_SEND_DUP_CNT,
+            SAMPLE_INTERVAL_MS,
+            SAMPLE_SEND_AMNT,
+            DEBOUNCE_US};
+        saveSystemSettingsToEEPROM(sysSettings);
 
-      delay(100);
-
-      // ✅ 成功通知：青ランプ点灯
-      initLed();
-      flashLedProfile(&BlueProfile, 2000, 1);
-
-      while (true)
         delay(100);
+
+        // ✅ 成功通知：青ランプ点灯
+        initLed();
+        flashLedProfile(&BlueProfile, 2000, 1);
+
+        // SDカードを抜いてリセットするよう促す（ESP.restart()だとSDが刺さったまま無限ループになる）
+        while (true)
+          delay(100);
+      }
+      else
+      {
+        // ❌️ 失敗通知：赤ランプ点灯
+        initLed();
+        flashLedProfile(&RedProfile, 2000, 1);
+
+        while (true)
+          delay(100);
+      }
     }
     else
     {
-      // ❌️ 失敗通知：赤ランプ点灯
-      initLed();
-      flashLedProfile(&RedProfile, 2000, 1);
-
-      while (true)
-        delay(100);
+      // Serial.println("SDカードが見つからないか、設定ファイルがありません。EEPROMから復元します。");
     }
   }
-  else
-  {
-    // Serial.println("SDカードが見つからないか、設定ファイルがありません。EEPROMから復元します。");
-  }
 
-  // ✅ EEPROMからプロファイルを復元
+  // ✅ EEPROMからプロファイルを復元（失敗時はフォールバック設定を使用）
   if (!restoreProfilesFromEEPROM())
   {
-    initLed();
-    while (true)
+    wifiProfiles[0]  = fallbackProfile;
+    profileCount     = 1;
+    selectedProfileIndex = 0;
+    if (fallbackUsbMode)
     {
-      flashOnce(&RedProfile, BLINK_INTERVAL_SYNC);
-      delay(BLINK_INTERVAL_SYNC);
+      EEPROM.write(EEPROM_ADDR_USB_MODE, 1);
+      EEPROM.commit();
     }
   }
 
@@ -405,22 +429,23 @@ void setup()
 
   selectedProfileIndex = loadProfileIndexFromEEPROM();
   activeProfileIndex = selectedProfileIndex;
+  usbMode = (EEPROM.read(EEPROM_ADDR_USB_MODE) == 1);
 
   if (profileCount == 0)
   {
-    // Serial.println("EEPROMに有効なプロファイルが見つかりません。");
-    //  プロファイルがないので、colorも設定しない
-    return;
+    if (!usbMode)
+    {
+      // Serial.println("EEPROMに有効なプロファイルが見つかりません。");
+      return;
+    }
+    // USBモードはプロファイルなしで動作可能
   }
-
-  if (selectedProfileIndex >= profileCount)
+  else
   {
-    // Serial.println("⚠️ EEPROMのプロファイルインデックスが無効です。0にリセットします");
-    selectedProfileIndex = 0;
+    if (selectedProfileIndex >= profileCount)
+      selectedProfileIndex = 0;
+    activeProfileIndex = selectedProfileIndex;
   }
-
-  activeProfileIndex = selectedProfileIndex;
-  usbMode = (EEPROM.read(EEPROM_ADDR_USB_MODE) == 1);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(KEY_PIN, INPUT_PULLUP);
@@ -431,12 +456,14 @@ void setup()
   initLed();
   setDataColor(0, 255, 0);
 
-  ColorProfile *c = wifiProfiles[selectedProfileIndex].color;
-  if (!c)
+  if (profileCount > 0)
   {
-    // Serial.println("⚠️ color が null です！");
-    c = &RedProfile; // 安全なデフォルトに退避
-    wifiProfiles[selectedProfileIndex].color = c;
+    ColorProfile *c = wifiProfiles[selectedProfileIndex].color;
+    if (!c)
+    {
+      c = &RedProfile;
+      wifiProfiles[selectedProfileIndex].color = c;
+    }
   }
   if (usbMode) setLedColor(255, 0, 0);
   else setLedFromProfileIndex(selectedProfileIndex);
@@ -462,7 +489,7 @@ void setup()
           delay(150);
         }
       }
-      else
+      else if (profileCount > 0)
       {
         selectedProfileIndex = (selectedProfileIndex + 1) % profileCount;
         if (usbMode) setLedColor(255, 0, 0);
@@ -1072,7 +1099,7 @@ bool loadWiFiProfilesFromSD()
   if (!file)
     return false;
 
-  WiFiProfile temp;
+  WiFiProfile temp = {};
   ColorProfile *color = &cyanProfile;
   profileCount = 0;
   bool hasData = false;
