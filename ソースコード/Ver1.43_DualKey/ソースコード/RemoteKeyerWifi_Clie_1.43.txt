@@ -1,0 +1,1431 @@
+/*=============================================================================*
+ * M5Stack ATOM S3 Lite クライアント用ファームウェア  Ver1.42
+ * USB-NCMモード: iOS / Android と USB-C 直結 (192.168.7.x ネットワーク)
+ *   - ESP32-S3 が USB-NCM デバイスとして動作
+ *   - iOS/Android アプリが中継 (NCM UDP 8888 ↔ Server UDP 8889)
+ * WiFiモード: Server AP へ直接接続 (従来と同じ)
+ * 共通: EEPROM プロファイル, SDカードなし, SYNCタイミング, PING/PONG
+ *
+ * USBNCM.h は arduino-esp32 >= 3.1.0 (espressif32 >= 6.9.0) が必要。
+ * 旧バージョンでは HAS_USBNCM=0 となり USB-CDC シリアルトンネルに自動フォールバック。
+ *
+ * Copyright (C) 2025- JI1ORE
+ *=============================================================================*/
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
+#include "esp_wifi.h"
+#include <EEPROM.h>
+#include "M5Unified.h"
+#include <FastLED.h>
+
+// ---- BLE (Nordic UART Service) ----------------------------------------------
+#include <BLEDevice.h>
+#include <BLEServer.h>
+
+#define NUS_SERVICE_UUID  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_CHAR_UUID  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_CHAR_UUID  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+static BLEServer         *g_bleServer = nullptr;
+static BLECharacteristic *g_bleTxChar = nullptr;
+static bool               g_bleClientConnected = false;
+static uint8_t            g_bleRxBuf[64];
+static int                g_bleRxLen = 0;
+
+class BleSrvCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *) override    { g_bleClientConnected = true; }
+  void onDisconnect(BLEServer *) override {
+    g_bleClientConnected = false;
+    BLEDevice::startAdvertising();
+  }
+};
+
+class BleRxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    String v = ch->getValue();
+    int n = (int)v.length();
+    if (n <= 0) return;
+    if (g_bleRxLen + n > (int)sizeof(g_bleRxBuf)) {
+      int drop = (g_bleRxLen + n) - (int)sizeof(g_bleRxBuf);
+      memmove(g_bleRxBuf, g_bleRxBuf + drop, g_bleRxLen - drop);
+      g_bleRxLen -= drop;
+    }
+    memcpy(g_bleRxBuf + g_bleRxLen, v.c_str(), n);
+    g_bleRxLen += n;
+  }
+};
+
+// ---- USB-NCM ----------------------------------------------------------------
+#if __has_include("USB.h")
+  #include "USB.h"
+#endif
+#if defined(FORCE_CDC_MODE)
+  #define HAS_USBNCM 0
+#elif __has_include("USBNCM.h")
+  #include "USBNCM.h"
+  static USBNCM ncm;
+  #define HAS_USBNCM 1
+#else
+  #define HAS_USBNCM 0
+#endif
+
+// NCM インタフェース固定 IP
+static const IPAddress NCM_LOCAL_IP(192, 168, 7, 1);   // ATOM S3 Lite (デバイス)
+static const IPAddress NCM_HOST_IP (192, 168, 7, 2);   // iOS/Android (ホスト, DHCP割当)
+static const IPAddress NCM_SUBNET  (255, 255, 255, 252);
+
+// ---- EEPROM -----------------------------------------------------------------
+#define EEPROM_ADDR_PROFILE_INDEX  0
+#define EEPROM_ADDR_USB_MODE       1
+#define EEPROM_ADDR_NCM_MODE       2   // 1=NCM(iOS), 0=CDC(Android)
+#define EEPROM_ADDR_WPM            3   // WPM (5-60), 0xFF=未初期化
+#define EEPROM_ADDR_PADDLE_SWAP    4   // パドル左右入替 (1=入替, 0=通常)
+#define EEPROM_ADDR_BLE_MODE       5   // 1=BLE NUS (Android wireless), 0=CDC
+#define EEPROM_ADDR_USB_ONCE       6   // 0xAB=次回起動をUSB CDCで(読んだら即クリア)
+#define EEPROM_ADDR_PROFILE_BASE  16
+#define MAX_WIFI_PROFILES          5
+#define EEPROM_SIZE (sizeof(WiFiProfileEEPROM) * MAX_WIFI_PROFILES + sizeof(SystemSettingsEEPROM) + 16)
+#define EEPROM_ADDR_SETTINGS (EEPROM_ADDR_PROFILE_BASE + sizeof(WiFiProfileEEPROM) * MAX_WIFI_PROFILES)
+
+#define MAX_SSID_LEN     32
+#define MAX_PASS_LEN     64
+#define MAX_HOSTNAME_LEN 32
+#define PROFILE_MAGIC    0xA5
+
+struct __attribute__((packed)) WiFiProfileEEPROM {
+  uint8_t magic;
+  char    ssid[MAX_SSID_LEN];
+  char    password[MAX_PASS_LEN];
+  uint8_t localIP[4];
+  uint8_t gateway[4];
+  uint8_t subnet[4];
+  uint8_t serverIP[4];
+  bool    isApMode;
+  bool    hasIP;
+  uint8_t colorId;
+  char    hostname[MAX_HOSTNAME_LEN];
+  char    serverhostname[MAX_HOSTNAME_LEN];
+};
+
+struct __attribute__((packed)) SystemSettingsEEPROM {
+  uint8_t       magic;
+  int           keyRepeatCount;
+  int           sampleSendDupCnt;
+  int           sampleIntervalMs;
+  int           sampleSendAmnt;
+  unsigned long debounceUs;
+};
+
+// ---- ピン定義 ---------------------------------------------------------------
+#ifdef M5ATOMLite
+// ATOM Lite (ESP32)
+const int LED_PIN        = 27;
+const int BUTTON_PIN     = 39;
+const int SD_SPI_CS_PIN  = -1;
+#define DIT_PIN  32   // 右パドル (短点) Grove SCL
+#define DAH_PIN  26   // 左パドル (長点) Grove SDA
+#else
+// ATOM S3 Lite (ESP32-S3)
+const int BUTTON_PIN     = 41;
+const int SD_SPI_CS_PIN  = -1;
+#define DIT_PIN        0   // 右パドル (短点) G0
+#define DAH_PIN       17   // 左パドル (長点) G17
+#define LED_DATA_PIN  21   // WS2812B データ: [0]=左(DAH) → [1]=右(DIT)
+#define LED_PWR_PIN   40   // WS2812B 電源制御 (HIGH=ON)
+#define NUM_KEY_LEDS   2
+#endif
+#define ESP_INTR_FLAG_DEFAULT 0
+
+// ---- 色設定 ------------------------------------------------------------------
+struct ColorProfile { const char *name; uint8_t r, g, b; };
+static ColorProfile MagentaProfile = {"Magenta", 255,   0, 255};
+static ColorProfile OrangeProfile  = {"Orange",  255, 165,   0};
+static ColorProfile yellowProfile  = {"Yellow",  255, 255,   0};
+static ColorProfile cyanProfile    = {"Cyan",      0, 255, 255};
+static ColorProfile RedProfile     = {"Red",     255,   0,   0};
+static ColorProfile BlueProfile    = {"Blue",      0,   0, 255};
+static ColorProfile GreenProfile   = {"Green",     0, 255,   0};
+static ColorProfile WhiteProfile   = {"White",   255, 255, 255};
+
+// ---- WiFi プロファイル -------------------------------------------------------
+struct WiFiProfile {
+  const char *ssid;
+  const char *password;
+  IPAddress   localIP, gateway, subnet, serverIP;
+  bool        isApMode;
+  bool        hasIP;
+  ColorProfile *color;
+  const char *hostname;
+  const char *serverhostname;
+};
+
+static WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
+static int profileCount = 0;
+
+static WiFiProfile fallbackProfile = {
+  "RemoteKeyer-AP", "password123",
+  IPAddress(192,168,4,2), IPAddress(192,168,4,1), IPAddress(255,255,255,0), IPAddress(192,168,4,1),
+  true, false, &cyanProfile, "RKCLIENT01", "RKSERVER01"
+};
+static const bool fallbackUsbMode = true;
+
+static IPAddress serverIP;
+
+// ---- UDP --------------------------------------------------------------------
+#define LOCAL_PORT  8888
+#define SERVER_PORT 8888
+static WiFiUDP Udp;
+
+// ---- LED --------------------------------------------------------------------
+// G21(DATA) → WS2812B [0]左(DAH) → [1]右(DIT), G40=電源制御(HIGH=ON)
+
+// ---- 動作パラメータ ----------------------------------------------------------
+static unsigned long MAX_ON_DURATION    = 3000;
+static const int     PING_INTERVAL      = 5000;
+static const int     ReCal_RTT          = 5000;
+static int           keyRepeatCount     = 10;
+static int           SAMPLE_SEND_DUP_CNT = 1;
+static int           SAMPLE_INTERVAL_MS  = 10;
+static int           SAMPLE_SEND_AMNT    = 8;
+static unsigned long DEBOUNCE_US         = 5000;
+static const int     HOSTNAME_RESTIME    = 30;
+
+static const int RTT_THRESH_1 = 5,  RTT_THRESH_2 = 10,  RTT_THRESH_3 = 25;
+static const int RTT_THRESH_4 = 50, RTT_THRESH_5 = 75,  RTT_THRESH_6 = 100, RTT_THRESH_7 = 200;
+static const int DELAY_VERY_LOW=100, DELAY_LOW=100, DELAY_MID=100, DELAY_HIGH=100;
+static const int DELAY_VERY_HIGH=150, DELAY_VERY2_HIGH=150, DELAY_VERY3_HIGH=250, DELAY_MAX=500;
+
+static const unsigned long BLINK_INTERVAL_WIFI = 1000;
+static const unsigned long BLINK_INTERVAL_SYNC =  300;
+static unsigned long blinkInterval = BLINK_INTERVAL_WIFI;
+
+// ---- イアンビック・キーヤー --------------------------------------------------
+static int           wpm          = 20;   // サーバー(0xE2パケット)から更新
+enum KeyerState { KEYER_IDLE, KEYER_DIT_ON, KEYER_DIT_OFF, KEYER_DAH_ON, KEYER_DAH_OFF };
+static KeyerState keyerState = KEYER_IDLE;
+
+// ---- パドル + キーヤー イベント駆動 -------------------------------------------
+// ISR は FALLING(押下)のみ。解放検知は digitalRead() で直接確認し
+// バウンスによる誤判定(ditState が false になりIDLEに落ちる問題)を回避する。
+enum KeyEvt : uint8_t { KEVT_NONE=0, KEVT_DIT_DN, KEVT_DAH_DN, KEVT_UNIT };
+static volatile KeyEvt  g_evtBuf[16];
+static volatile uint8_t g_evtW = 0, g_evtR = 0;
+
+static inline void IRAM_ATTR pushEvt(KeyEvt e) {
+  uint8_t nxt = (g_evtW + 1) & 15;
+  if (nxt != g_evtR) { g_evtBuf[g_evtW] = e; g_evtW = nxt; }
+}
+static inline KeyEvt popEvt() {
+  if (g_evtR == g_evtW) return KEVT_NONE;
+  KeyEvt e = g_evtBuf[g_evtR]; g_evtR = (g_evtR + 1) & 15; return e;
+}
+
+static bool paddleSwapped = false;  // パドル左右入替フラグ (ISRから参照するため早めに宣言)
+
+// FALLING のみ: 押下イベントをキューに積む (解放は readPaddles で都度確認)
+void IRAM_ATTR ditISR() { pushEvt(paddleSwapped ? KEVT_DAH_DN : KEVT_DIT_DN); }
+void IRAM_ATTR dahISR() { pushEvt(paddleSwapped ? KEVT_DIT_DN : KEVT_DAH_DN); }
+
+// GPIO_IN レジスタを 1 回読んで DIT/DAH 状態を原子的に取得
+// DIT_PIN=G0, DAH_PIN=G17 はどちらも GPIO 0-31 レジスタに存在
+#include "soc/gpio_reg.h"
+static inline void readPaddles(bool &dit, bool &dah) {
+  uint32_t reg = REG_READ(GPIO_IN_REG);
+  bool pinDit = !(reg & (1u << DIT_PIN));
+  bool pinDah = !(reg & (1u << DAH_PIN));
+  dit = paddleSwapped ? pinDah : pinDit;
+  dah = paddleSwapped ? pinDit : pinDah;
+}
+
+static hw_timer_t *g_keyerTimer = nullptr;
+void IRAM_ATTR onKeyerTimer() { pushEvt(KEVT_UNIT); }
+
+static void armKeyerTimer(unsigned long unitMs) {
+  timerWrite(g_keyerTimer, 0);
+  timerAlarm(g_keyerTimer, (uint64_t)unitMs * 1000ULL, false, 0);  // one-shot, μs単位
+}
+
+// ---- 状態変数 ----------------------------------------------------------------
+static unsigned long lastOnMillis          = 0;
+static unsigned long lastBlinkMillis       = 0;
+static unsigned long lastPingMillis        = 0;
+static unsigned long lastPingSendMillis    = 0;
+static unsigned long lastSyncRequestMillis = 0;
+static int64_t       delayOffsetMs         = 0;
+static bool          timeSynced            = false;
+static bool          ledState              = false;
+static unsigned long dynamicTimeout        = 8000;
+static unsigned long lastDelayRecalcMillis = 0;
+static int           fixedDelayMs          = 50;
+static bool          fixedDelayLocked      = false;
+static bool          currentKeyState       = false;
+static bool          usbMode               = false;
+static bool          ncmMode               = true;  // true=NCM(iOS), false=CDC(Android)
+static bool          bleMode               = false;  // BLE NUS モード (AtomS3 BLE使用)
+static int           lostPingCount         = 0;
+static bool          pongReceived          = true;
+static const unsigned long DEFAULT_TIMEOUT = 12000;
+static int           activeProfileIndex    = -1;
+static unsigned long profileSelectStart    = 0;
+static const unsigned long PROFILE_SELECT_WINDOW = 10000;
+static int           selectedProfileIndex  = 0;
+static unsigned long fixedDelayLockUntil   = 0;
+
+// ---- キーLED (WS2812B / FastLED) ---------------------------------------------
+// G21(DATA) → [0]左(DAH)LED → [1]右(DIT)LED, G40=電源制御(HIGH=ON)
+static CRGB g_keyLeds[NUM_KEY_LEDS];
+static bool ledDirty = false;  // FastLED.show() は g_keyLeds 変更時のみ呼ぶ (RMT DMAの過負荷防止)
+
+// ---- サンプリング ------------------------------------------------------------
+static byte          keyBuf          = 0;
+static int           sampleIndex     = 0;
+static unsigned long sampleStartTimeMs = 0;
+static unsigned long lastSampleTimeMs  = 0;
+static unsigned long sampleTimes[16];
+
+// ---- RTT / SYNC --------------------------------------------------------------
+static const int RTT_HISTORY_SIZE = 5;
+static long      rttHistory[RTT_HISTORY_SIZE] = {0};
+static int       rttIndex = 0;
+static long      pingRttMs = 0;
+static const int SYNC_SAMPLE_COUNT = 10;
+static int       syncSampleIndex   = 0;
+static int64_t   syncOffsets[SYNC_SAMPLE_COUNT];
+static bool      syncCollecting    = false;
+
+// ---- 関数プロトタイプ --------------------------------------------------------
+void initBluetooth();
+bool connectToWiFi();
+void requestMillisSync();
+void sendKeyPacket(bool isOn, byte trxSel, uint64_t opTimeMs);
+void sendKeyEvent(bool isOn, unsigned long atMs);
+void processKeyerEvent(KeyEvt evt, unsigned long nowMs);
+void initLed();
+void clearLed();
+void setLedFromProfileIndex(int index);
+void setLedColor(uint8_t r, uint8_t g, uint8_t b);
+void setLedColorFromProfile(ColorProfile *color);
+void flashLedProfile(ColorProfile *color, int durationMs, int repeat);
+void flashOnce(ColorProfile *color, int durationMs);
+void flashRedBeforeRestart();
+void saveProfileIndexToEEPROM(int index);
+int  loadProfileIndexFromEEPROM();
+void saveWiFiProfileToEEPROM(const WiFiProfile &src, int index);
+bool loadWiFiProfileFromEEPROM(WiFiProfile &dst, int index);
+void clearEEPROM();
+bool restoreProfilesFromEEPROM();
+void getserverIP();
+void saveSystemSettingsToEEPROM(const SystemSettingsEEPROM &settings);
+bool loadSystemSettingsFromEEPROM(SystemSettingsEEPROM &settings);
+int  rttToDelayMs(long rttMs);
+void freeWiFiProfileStrings(WiFiProfile &p);
+long getAverageRtt();
+bool initNcm();
+
+// ---- ユーティリティ ----------------------------------------------------------
+int rttToDelayMs(long rttMs) {
+  if (rttMs <= RTT_THRESH_1) return DELAY_VERY_LOW;
+  if (rttMs <= RTT_THRESH_2) return DELAY_LOW;
+  if (rttMs <= RTT_THRESH_3) return DELAY_MID;
+  if (rttMs <= RTT_THRESH_4) return DELAY_HIGH;
+  if (rttMs <= RTT_THRESH_5) return DELAY_VERY_HIGH;
+  if (rttMs <= RTT_THRESH_6) return DELAY_VERY2_HIGH;
+  if (rttMs <= RTT_THRESH_7) return DELAY_VERY3_HIGH;
+  return DELAY_MAX;
+}
+
+long getAverageRtt() {
+  long sum = 0;
+  for (int i = 0; i < RTT_HISTORY_SIZE; i++) sum += rttHistory[i];
+  return sum / RTT_HISTORY_SIZE;
+}
+
+void freeWiFiProfileStrings(WiFiProfile &p) {
+  if (p.ssid)           { free(const_cast<char*>(p.ssid));           p.ssid           = nullptr; }
+  if (p.password)       { free(const_cast<char*>(p.password));       p.password       = nullptr; }
+  if (p.hostname)       { free(const_cast<char*>(p.hostname));       p.hostname       = nullptr; }
+  if (p.serverhostname) { free(const_cast<char*>(p.serverhostname)); p.serverhostname = nullptr; }
+}
+
+// ---- USB-NCM 初期化 ----------------------------------------------------------
+bool initNcm() {
+#if HAS_USBNCM
+  ncm.setLocalIP(NCM_LOCAL_IP);
+  ncm.setSubnetMask(NCM_SUBNET);
+  ncm.begin();
+  USB.begin();
+  // ホスト接続を最大 15 秒待つ
+  unsigned long t = millis();
+  while (!ncm && millis() - t < 15000) {
+    setLedColor(255, 0, 0);  // 赤: 接続待ち
+    delay(200);
+    clearLed();
+    delay(200);
+  }
+  return (bool)ncm;
+#else
+  return false;  // フォールバック: シリアルトンネル使用
+#endif
+}
+
+// ---- キーイベント送信 (UDP/CDC 両対応) ----------------------------------------
+void sendKeyEvent(bool isOn, unsigned long atMs) {
+  uint64_t opTimeMs = (uint64_t)((int64_t)atMs + delayOffsetMs + (int64_t)fixedDelayMs);
+  fixedDelayLocked = true;
+
+  if (bleMode) {
+    uint8_t cwPkt[10];
+    cwPkt[0] = isOn ? 0x01 : 0x00;
+    cwPkt[1] = 0x01;
+    for (int i = 0; i < 8; i++) cwPkt[2+i] = (opTimeMs >> (56 - i*8)) & 0xFF;
+    if (g_bleTxChar && g_bleClientConnected) {
+      g_bleTxChar->setValue(cwPkt, 10);
+      g_bleTxChar->notify();
+    }
+    fill_solid(g_keyLeds, NUM_KEY_LEDS, isOn ? CRGB(0, 0, 255) : CRGB(0, 0, 10));
+    ledDirty = true;
+    currentKeyState = isOn;
+    if (isOn) lastOnMillis = atMs;
+    return;
+  }
+
+#if HAS_USBNCM
+  bool useCdc = usbMode && !ncmMode;
+#else
+  bool useCdc = usbMode;
+#endif
+
+  if (useCdc) {
+    uint8_t cwPkt[10];
+    cwPkt[0] = isOn ? 0x01 : 0x00;
+    cwPkt[1] = 0x01;
+    for (int i = 0; i < 8; i++) cwPkt[2+i] = (opTimeMs >> (56 - i*8)) & 0xFF;
+    Serial.write(cwPkt, 10);
+  } else {
+    sendKeyPacket(isOn, 0x01, opTimeMs);
+  }
+
+  currentKeyState = isOn;
+  if (isOn) {
+    lastOnMillis = atMs;
+    if (useCdc) {
+      bool pinDit = (digitalRead(DIT_PIN) == LOW);
+      bool pinDah = (digitalRead(DAH_PIN) == LOW);
+      bool ditLow = paddleSwapped ? pinDah : pinDit;
+      bool dahLow = paddleSwapped ? pinDit : pinDah;
+      if (!ditLow && !dahLow) { ditLow = true; dahLow = true; }
+      g_keyLeds[0] = dahLow ? CRGB(0, 0, 255) : CRGB::Black;  // [0]左→DAH(青)
+      g_keyLeds[1] = ditLow ? CRGB(0, 255, 0) : CRGB::Black;  // [1]右→DIT(緑)
+      ledDirty = true;
+    }
+  } else {
+    if (useCdc) {
+      fill_solid(g_keyLeds, NUM_KEY_LEDS, CRGB::Black);
+      ledDirty = true;
+    }
+  }
+}
+
+// ---- イアンビック・キーヤー (Mode A) イベント駆動 ----------------------------
+// 継続判定は digitalRead() で確定値を読む
+// (ISR の ditState/dahState はバウンスで誤 false になるため使用しない)
+void processKeyerEvent(KeyEvt evt, unsigned long now) {
+  if (!timeSynced) return;
+  unsigned long unit = 1200UL / (unsigned long)wpm;
+  // keyerTimeMs: 現在ステートの終了予定時刻（次のON/OFFをこの時刻でスケジュール）
+  static unsigned long keyerTimeMs = 0;
+
+  switch (keyerState) {
+    case KEYER_IDLE: {
+      if (evt == KEVT_DIT_DN || evt == KEVT_DAH_DN) {
+        bool startDit = (evt == KEVT_DIT_DN);  // ISRイベント種別を優先 (readPaddlesの一時ノイズを回避)
+        unsigned long dur = startDit ? unit : 3 * unit;
+        sendKeyEvent(true, now);
+        keyerTimeMs = now + dur;   // 次のOFF予定時刻
+        armKeyerTimer(dur);
+        keyerState = startDit ? KEYER_DIT_ON : KEYER_DAH_ON;
+      }
+      break;
+    }
+    case KEYER_DIT_ON:
+      if (evt == KEVT_UNIT) {
+        sendKeyEvent(false, keyerTimeMs);  // スペース開始 = DIT終了予定時刻
+        keyerTimeMs += unit;               // 次のON予定時刻（スペース終了）
+        armKeyerTimer(unit);
+        keyerState = KEYER_DIT_OFF;
+      }
+      break;
+
+    case KEYER_DIT_OFF: {
+      if (evt == KEVT_UNIT) {
+        bool dit, dah; readPaddles(dit, dah);
+        if (dah) {
+          sendKeyEvent(true, keyerTimeMs); keyerTimeMs += 3 * unit; armKeyerTimer(3 * unit); keyerState = KEYER_DAH_ON;
+        } else if (dit) {
+          sendKeyEvent(true, keyerTimeMs); keyerTimeMs += unit;     armKeyerTimer(unit);     keyerState = KEYER_DIT_ON;
+        } else {
+          keyerState = KEYER_IDLE;
+        }
+      }
+      break;
+    }
+    case KEYER_DAH_ON:
+      if (evt == KEVT_UNIT) {
+        sendKeyEvent(false, keyerTimeMs);
+        keyerTimeMs += unit;
+        armKeyerTimer(unit);
+        keyerState = KEYER_DAH_OFF;
+      }
+      break;
+
+    case KEYER_DAH_OFF: {
+      if (evt == KEVT_UNIT) {
+        bool dit, dah; readPaddles(dit, dah);
+        if (dit) {
+          sendKeyEvent(true, keyerTimeMs); keyerTimeMs += unit;     armKeyerTimer(unit);     keyerState = KEYER_DIT_ON;
+        } else if (dah) {
+          sendKeyEvent(true, keyerTimeMs); keyerTimeMs += 3 * unit; armKeyerTimer(3 * unit); keyerState = KEYER_DAH_ON;
+        } else {
+          keyerState = KEYER_IDLE;
+        }
+      }
+      break;
+    }
+  }
+}
+
+// ---- setup() ----------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  initLed();
+
+  auto cfg = M5.config();
+  cfg.external_spk = false;
+  cfg.internal_mic = false;
+  cfg.output_power = false;
+  cfg.clear_display = false;
+  M5.begin(cfg);
+
+  // SD カードなし (SD_SPI_CS_PIN == -1) → スキップ
+  // EEPROMからプロファイルを復元
+  if (!restoreProfilesFromEEPROM()) {
+    wifiProfiles[0]      = fallbackProfile;
+    profileCount         = 1;
+    selectedProfileIndex = 0;
+    if (fallbackUsbMode) {
+      EEPROM.write(EEPROM_ADDR_USB_MODE, 1);
+      EEPROM.commit();
+    }
+  }
+  if (selectedProfileIndex >= profileCount) selectedProfileIndex = 0;
+
+  SystemSettingsEEPROM sysSettings;
+  if (loadSystemSettingsFromEEPROM(sysSettings)) {
+    keyRepeatCount   = constrain(sysSettings.keyRepeatCount,   1, 50);
+    SAMPLE_SEND_DUP_CNT = constrain(sysSettings.sampleSendDupCnt, 1, 10);
+    SAMPLE_INTERVAL_MS  = constrain(sysSettings.sampleIntervalMs,  1, 100);
+    SAMPLE_SEND_AMNT    = constrain(sysSettings.sampleSendAmnt,    1, 16);
+    DEBOUNCE_US         = constrain((long)sysSettings.debounceUs, 100L, 50000L);
+  } else {
+    sysSettings = {0xA5, 10, 1, 10, 8, 5000};
+    saveSystemSettingsToEEPROM(sysSettings);
+  }
+
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
+  activeProfileIndex   = selectedProfileIndex;
+  usbMode = (EEPROM.read(EEPROM_ADDR_USB_MODE) != 0x00);  // 0=WiFi, else(0x01 or 0xFF未初期化)=USB
+  ncmMode = (EEPROM.read(EEPROM_ADDR_NCM_MODE) == 1);  // 0x01=NCM(iOS), それ以外(0xFF未初期化含む)=CDC(Android)
+  bleMode = (EEPROM.read(EEPROM_ADDR_BLE_MODE) == 1);  // 0x01=BLE NUS, それ以外=CDC
+  { uint8_t sw = EEPROM.read(EEPROM_ADDR_WPM); if (sw >= 5 && sw <= 60) wpm = sw; }
+  paddleSwapped = (EEPROM.read(EEPROM_ADDR_PADDLE_SWAP) == 1);
+
+  // USB CDC一回フラグ: BLEループがESP.restart()前に書く → 読んだら即クリア
+  // フラグが無ければ(電源断後など)BLEをデフォルトにする
+  bool usbCdcOnce = (EEPROM.read(EEPROM_ADDR_USB_ONCE) == 0xAB);
+  if (usbCdcOnce) {
+    EEPROM.write(EEPROM_ADDR_USB_ONCE, 0x00);
+    EEPROM.commit();  // 即クリア: 次回電源断後はフラグなし→BLEになる
+  }
+  bool skipWindow = (usbCdcOnce && usbMode && !ncmMode);
+  if (skipWindow) {
+    bleMode = false;  // USB CDC直行
+  } else if (usbMode && !ncmMode) {
+    bleMode = true;   // 電源投入はBLEデフォルト
+  }
+
+  if (profileCount == 0 && !usbMode) { EEPROM.end(); return; }
+  if (selectedProfileIndex >= profileCount) selectedProfileIndex = 0;
+  activeProfileIndex = selectedProfileIndex;
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(DIT_PIN,    INPUT_PULLUP);
+  pinMode(DAH_PIN,    INPUT_PULLUP);
+
+  if (!skipWindow) {
+    profileSelectStart = millis();
+
+    auto showUsbLed = [&]() {
+      if (bleMode) setLedColorFromProfile(&RedProfile);
+      else         setLedColorFromProfile(&OrangeProfile);
+    };
+
+    initLed();
+    if (usbMode) showUsbLed();
+    else         setLedFromProfileIndex(selectedProfileIndex);
+
+    static unsigned long lastBlinkMs = 0;
+    static bool blinkState = true;
+    while (millis() - profileSelectStart < PROFILE_SELECT_WINDOW) {
+      // 点滅 (500ms周期)
+      if (millis() - lastBlinkMs >= 500) {
+        lastBlinkMs = millis();
+        blinkState = !blinkState;
+        if (blinkState) {
+          if (usbMode) showUsbLed();
+          else         setLedFromProfileIndex(selectedProfileIndex);
+        } else {
+          clearLed();
+        }
+        FastLED.show();
+      }
+      // アプリからUSBデータ受信で USB CDCに切替 (Serial=trueだけでは不十分)
+      // 充電器/アプリ未起動のPCはデータを送らないので誤検出しない
+      if (bleMode && usbMode && Serial.available() > 0) {
+        bleMode = false;
+        for (int i = 0; i < 3; i++) { clearLed(); FastLED.show(); delay(80); showUsbLed(); FastLED.show(); delay(80); }
+        break;  // 残り時間をスキップしてUSB CDCへ直行
+      }
+      // 左パドル (DAH): USB CDCモードに切替
+      if (digitalRead(DAH_PIN) == LOW) {
+        delay(20);
+        while (digitalRead(DAH_PIN) == LOW) delay(10);
+        bleMode = false;
+        usbMode = true;
+        for (int i = 0; i < 3; i++) { clearLed(); FastLED.show(); delay(80); showUsbLed(); FastLED.show(); delay(80); }
+        lastBlinkMs = millis(); blinkState = true;
+      }
+      // 右パドル (DIT): BLEモードに切替
+      if (digitalRead(DIT_PIN) == LOW) {
+        delay(20);
+        while (digitalRead(DIT_PIN) == LOW) delay(10);
+        bleMode = true;
+        usbMode = true;
+        for (int i = 0; i < 3; i++) { clearLed(); FastLED.show(); delay(80); showUsbLed(); FastLED.show(); delay(80); }
+        lastBlinkMs = millis(); blinkState = true;
+      }
+      // メインボタン: 長押し=WiFi/USB切替、短押し=WiFiモード時プロファイル切替
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        unsigned long pressStart = millis();
+        delay(20);
+        while (digitalRead(BUTTON_PIN) == LOW && millis() - pressStart < 3000) delay(10);
+        unsigned long dur = millis() - pressStart;
+        if (dur >= 1000) {
+          usbMode = !usbMode;
+          for (int i = 0; i < 3; i++) {
+            clearLed(); FastLED.show(); delay(150);
+            if (usbMode) showUsbLed();
+            else         setLedFromProfileIndex(selectedProfileIndex);
+            FastLED.show(); delay(150);
+          }
+          lastBlinkMs = millis(); blinkState = true;
+        } else if (!usbMode && profileCount > 0) {
+          selectedProfileIndex = (selectedProfileIndex + 1) % profileCount;
+          setLedFromProfileIndex(selectedProfileIndex);
+          FastLED.show();
+          lastBlinkMs = millis(); blinkState = true;
+        }
+      }
+      delay(20);
+    }
+
+    EEPROM.write(EEPROM_ADDR_USB_MODE, usbMode ? 1 : 0);
+    EEPROM.write(EEPROM_ADDR_NCM_MODE, ncmMode ? 1 : 0);
+    EEPROM.write(EEPROM_ADDR_BLE_MODE, bleMode ? 1 : 0);
+    EEPROM.commit();
+    saveProfileIndexToEEPROM(selectedProfileIndex);
+    activeProfileIndex = selectedProfileIndex;
+  }
+
+  EEPROM.end();
+
+  // DIT/DAH: 割り込み制御 (CHANGE = 押下・解放両エッジ)
+  attachInterrupt(digitalPinToInterrupt(DIT_PIN), ditISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(DAH_PIN), dahISR, FALLING);
+  delay(30);  // リセット直後のピンノイズが落ち着くのを待つ
+  { KeyEvt e; while ((e = popEvt()) != KEVT_NONE) {} }  // 誤検出イベントをクリア
+  currentKeyState = false;
+  // キーヤー単位時間タイマー (1MHz → 1tick=1μs, one-shot)
+  g_keyerTimer = timerBegin(1000000);
+  timerAttachInterrupt(g_keyerTimer, onKeyerTimer);
+  esp_rom_gpio_pad_select_gpio((gpio_num_t)BUTTON_PIN);
+  gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_DISABLE);
+
+  if (usbMode) {
+#if HAS_USBNCM
+    if (ncmMode && !bleMode) {
+      // ---- USB-NCM モード (iOS) -------------------------------------------
+      initNcm();
+      serverIP = NCM_HOST_IP;
+      Udp.begin(LOCAL_PORT);
+      setLedColorFromProfile(&OrangeProfile);  // オレンジ: NCM接続中
+      syncCollecting  = true;
+      syncSampleIndex = 0;
+      requestMillisSync();
+      lastPingMillis = millis();
+      fixedDelayMs   = 100;
+    } else if (bleMode) {
+      // ---- BLE NUS モード (Android wireless) --------------------------------
+      syncCollecting  = true;
+      syncSampleIndex = 0;
+      initBluetooth();
+      setLedColor(0, 0, 255);  // 青: BLE advertising中
+    } else {
+      // ---- USB-CDC モード (Android) ----------------------------------------
+      syncCollecting  = true;
+      syncSampleIndex = 0;
+      // key OFFを確実に送信してから開始 (リセット直後の誤打鍵を解除)
+      { uint8_t offPkt[10] = {0x00,0x01,0,0,0,0,0,0,0,0}; Serial.write(offPkt, 10); }
+      byte pkt[5] = {0xE0, 0, 0, 0, 0};
+      unsigned long t = millis();
+      pkt[1]=(t>>24)&0xFF; pkt[2]=(t>>16)&0xFF;
+      pkt[3]=(t>>8)&0xFF;  pkt[4]=t&0xFF;
+      Serial.write(pkt, 5);
+      setLedColorFromProfile(&RedProfile);  // 赤: CDC待機中
+    }
+#else
+    if (bleMode) {
+      // ---- BLE NUS モード (Android wireless) --------------------------------
+      syncCollecting  = true;
+      syncSampleIndex = 0;
+      initBluetooth();
+      setLedColor(0, 0, 255);  // 青: BLE advertising中
+    } else {
+      // フォールバック: USB-CDC シリアルトンネル (NCM非対応ビルド)
+      syncCollecting  = true;
+      syncSampleIndex = 0;
+      { uint8_t offPkt[10] = {0x00,0x01,0,0,0,0,0,0,0,0}; Serial.write(offPkt, 10); }
+      byte pkt[5] = {0xE0, 0, 0, 0, 0};
+      unsigned long t = millis();
+      pkt[1]=(t>>24)&0xFF; pkt[2]=(t>>16)&0xFF;
+      pkt[3]=(t>>8)&0xFF;  pkt[4]=t&0xFF;
+      Serial.write(pkt, 5);
+      setLedColorFromProfile(&RedProfile);
+    }
+#endif
+    return;
+  }
+
+  // ---- WiFi モード ---------------------------------------------------------
+  connectToWiFi();
+  getserverIP();
+  Udp.begin(LOCAL_PORT);
+  syncCollecting  = true;
+  syncSampleIndex = 0;
+  requestMillisSync();
+  lastPingMillis = millis();
+}
+
+// ---- loop() -----------------------------------------------------------------
+void loop() {
+  unsigned long nowMillis = millis();
+  byte trxCode = 0x01;
+
+  // ---- BLE NUS 処理 (AtomS3 BLE モード) -------------------------------------
+  if (usbMode && !ncmMode && bleMode) {
+    static unsigned long lastBleSyncMs = 0;
+
+    // アプリからUSBデータ受信時のみUSBモードで再起動
+    // Serial=true(DTR)だけでは充電器/アプリ未起動PCと区別できない
+    if (Serial.available() > 0) {
+      EEPROM.begin(EEPROM_SIZE);
+      EEPROM.write(EEPROM_ADDR_USB_ONCE, 0xAB);  // 一回フラグ: 次回起動でUSB CDC
+      EEPROM.commit();
+      EEPROM.end();
+      delay(100);
+      ESP.restart();
+    }
+
+    // 先頭が不明バイトならスキップ
+    while (g_bleRxLen > 0 &&
+           g_bleRxBuf[0] != 0xE1 && g_bleRxBuf[0] != 0xE2 && g_bleRxBuf[0] != 0xE3) {
+      memmove(g_bleRxBuf, g_bleRxBuf + 1, g_bleRxLen - 1);
+      g_bleRxLen--;
+    }
+    // 0xE1 SYNCレスポンス (9バイト)
+    if (g_bleRxLen >= 9 && g_bleRxBuf[0] == 0xE1) {
+      uint32_t serverRecvMs = 0;
+      for (int i = 4; i < 8; i++) serverRecvMs = (serverRecvMs << 8) | g_bleRxBuf[1+i];
+      int64_t offset = (int64_t)serverRecvMs - (int64_t)(uint32_t)nowMillis;
+      if (syncCollecting) {
+        if (syncSampleIndex < SYNC_SAMPLE_COUNT) syncOffsets[syncSampleIndex++] = offset;
+        if (syncSampleIndex >= SYNC_SAMPLE_COUNT) {
+          int64_t minOff = syncOffsets[0];
+          for (int i = 1; i < SYNC_SAMPLE_COUNT; i++)
+            if (syncOffsets[i] < minOff) minOff = syncOffsets[i];
+          delayOffsetMs  = minOff;
+          timeSynced     = true;
+          syncCollecting = false;
+          fixedDelayMs   = 100;
+          setLedColor(0, 255, 0);  // 緑: 同期完了
+        } else {
+          uint8_t pkt[5] = {0xE0, 0, 0, 0, 0};
+          unsigned long t = millis();
+          pkt[1]=(t>>24)&0xFF; pkt[2]=(t>>16)&0xFF;
+          pkt[3]=(t>>8)&0xFF;  pkt[4]=t&0xFF;
+          if (g_bleTxChar && g_bleClientConnected) {
+            g_bleTxChar->setValue(pkt, 5); g_bleTxChar->notify();
+          }
+          lastBleSyncMs = nowMillis;
+        }
+      } else {
+        delayOffsetMs = offset;
+        lastBleSyncMs = nowMillis;
+      }
+      memmove(g_bleRxBuf, g_bleRxBuf+9, g_bleRxLen-9);
+      g_bleRxLen -= 9;
+    } else if (g_bleRxLen >= 16) { g_bleRxLen = 0; }
+
+    // 0xE2 WPM受信
+    if (g_bleRxLen >= 2 && g_bleRxBuf[0] == 0xE2) {
+      int newWpm = g_bleRxBuf[1];
+      if (newWpm >= 5 && newWpm <= 99 && newWpm != wpm) {
+        wpm = newWpm;
+        EEPROM.begin(EEPROM_SIZE); EEPROM.write(EEPROM_ADDR_WPM, (uint8_t)wpm); EEPROM.commit(); EEPROM.end();
+      }
+      memmove(g_bleRxBuf, g_bleRxBuf+2, g_bleRxLen-2);
+      g_bleRxLen -= 2;
+    }
+    // 0xE3 パドル入替
+    if (g_bleRxLen >= 2 && g_bleRxBuf[0] == 0xE3) {
+      bool newSwap = (g_bleRxBuf[1] == 0x01);
+      if (newSwap != paddleSwapped) {
+        paddleSwapped = newSwap;
+        EEPROM.begin(EEPROM_SIZE); EEPROM.write(EEPROM_ADDR_PADDLE_SWAP, paddleSwapped ? 1 : 0); EEPROM.commit(); EEPROM.end();
+      }
+      memmove(g_bleRxBuf, g_bleRxBuf+2, g_bleRxLen-2);
+      g_bleRxLen -= 2;
+    }
+
+    // 定期SYNC送信 (1500ms毎、接続中のみ)
+    if (g_bleClientConnected && nowMillis - lastBleSyncMs >= 1500) {
+      lastBleSyncMs = nowMillis;
+      uint8_t pkt[5] = {0xE0, 0, 0, 0, 0};
+      unsigned long t = millis();
+      pkt[1]=(t>>24)&0xFF; pkt[2]=(t>>16)&0xFF;
+      pkt[3]=(t>>8)&0xFF;  pkt[4]=t&0xFF;
+      g_bleTxChar->setValue(pkt, 5); g_bleTxChar->notify();
+    }
+
+    // 未同期時: LED点滅
+    if (!timeSynced) {
+      if (g_bleClientConnected) {
+        bool blink = (nowMillis / 500) % 2;
+        fill_solid(g_keyLeds, NUM_KEY_LEDS, blink ? CRGB(255, 255, 0) : CRGB::Black);
+      } else {
+        bool blink = (nowMillis / 1000) % 2;
+        fill_solid(g_keyLeds, NUM_KEY_LEDS, blink ? CRGB(0, 0, 255) : CRGB::Black);
+        // 未接続時はSYNC状態をリセット (次の接続時に即SYNCを送れるよう)
+        syncCollecting = true;
+        syncSampleIndex = 0;
+      }
+      FastLED.show();
+      yield();
+      return;
+    }
+
+    // 同期済み: イアンビック・キーヤー実行
+    { KeyEvt e; while ((e = popEvt()) != KEVT_NONE) processKeyerEvent(e, millis()); }
+    if (keyerState == KEYER_IDLE && timeSynced) {
+      bool dit, dah; readPaddles(dit, dah);
+      if (dit || dah) processKeyerEvent(dah ? KEVT_DAH_DN : KEVT_DIT_DN, millis());
+    }
+    if (currentKeyState && millis() - lastOnMillis > MAX_ON_DURATION) {
+      sendKeyEvent(false, millis());
+      keyerState = KEYER_IDLE;
+    }
+    // BLE切断検出
+    if (!g_bleClientConnected && timeSynced) {
+      timeSynced = false;
+      keyerState = KEYER_IDLE;
+    }
+    if (ledDirty) { FastLED.show(); ledDirty = false; }
+    yield();
+    return;
+  }  // end BLE block
+
+  // ---- USB-CDC 処理 (HAS_USBNCM==0 or CDCモード選択時) ----------------------
+#if HAS_USBNCM
+  if (usbMode && !ncmMode) {
+#else
+  if (usbMode) {
+#endif
+    // USB切断検出: 1秒以上Serialがなければ BLEモードで再起動
+    static unsigned long usbLostMs = 0;
+    if (!Serial) {
+      if (usbLostMs == 0) usbLostMs = nowMillis;
+      else if (nowMillis - usbLostMs > 1000) {
+        // USB_ONCE flagなし → 次回起動はBLEデフォルト
+        ESP.restart();
+      }
+      yield(); return;
+    } else {
+      usbLostMs = 0;
+    }
+
+    static byte usbRxBuf[16];
+    static int  usbRxLen = 0;
+    static unsigned long lastUsbSyncMs = 0;
+
+    while (Serial.available() > 0 && usbRxLen < 16)
+      usbRxBuf[usbRxLen++] = (byte)Serial.read();
+
+    // Skip unexpected bytes (e.g. 0xFF CDC wakeup from Android)
+    while (usbRxLen > 0 && usbRxBuf[0] != 0xE1 && usbRxBuf[0] != 0xE2 && usbRxBuf[0] != 0xE3) {
+      memmove(usbRxBuf, usbRxBuf + 1, usbRxLen - 1);
+      usbRxLen--;
+    }
+
+    if (usbRxLen >= 9 && usbRxBuf[0] == 0xE1) {
+      uint32_t serverRecvMs = 0;
+      for (int i = 4; i < 8; i++) serverRecvMs = (serverRecvMs << 8) | usbRxBuf[1+i];
+      int64_t offset = (int64_t)serverRecvMs - (int64_t)(uint32_t)nowMillis;
+      if (syncCollecting) {
+        if (syncSampleIndex < SYNC_SAMPLE_COUNT) syncOffsets[syncSampleIndex++] = offset;
+        if (syncSampleIndex >= SYNC_SAMPLE_COUNT) {
+          int64_t minOff = syncOffsets[0];
+          for (int i = 1; i < SYNC_SAMPLE_COUNT; i++)
+            if (syncOffsets[i] < minOff) minOff = syncOffsets[i];
+          delayOffsetMs  = minOff;
+          timeSynced     = true;
+          syncCollecting = false;
+          fixedDelayMs   = 100;
+          setLedColor(0, 255, 0);  // GREEN: 同期完了・使用可能
+        } else {
+          byte pkt[5] = {0xE0, 0, 0, 0, 0};
+          unsigned long t = millis();
+          pkt[1]=(t>>24)&0xFF; pkt[2]=(t>>16)&0xFF;
+          pkt[3]=(t>>8)&0xFF;  pkt[4]=t&0xFF;
+          Serial.write(pkt, 5);
+          lastUsbSyncMs = nowMillis;
+        }
+      } else {
+        delayOffsetMs = offset;
+        lastUsbSyncMs = nowMillis;
+      }
+      memmove(usbRxBuf, usbRxBuf+9, usbRxLen-9);
+      usbRxLen -= 9;
+    } else if (usbRxLen >= 16) { usbRxLen = 0; }
+
+    if (nowMillis - lastUsbSyncMs >= 1500) {
+      lastUsbSyncMs = nowMillis;
+      byte pkt[5] = {0xE0, 0, 0, 0, 0};
+      unsigned long t = millis();
+      pkt[1]=(t>>24)&0xFF; pkt[2]=(t>>16)&0xFF;
+      pkt[3]=(t>>8)&0xFF;  pkt[4]=t&0xFF;
+      Serial.write(pkt, 5);
+    }
+
+    // WPMパケット受信確認 (0xE2) - SYNC前でも受信できるよう早めに処理
+    if (usbRxLen >= 2 && usbRxBuf[0] == 0xE2) {
+      int newWpm = usbRxBuf[1];
+      if (newWpm >= 5 && newWpm <= 99 && newWpm != wpm) {
+        wpm = newWpm;
+        EEPROM.begin(EEPROM_SIZE); EEPROM.write(EEPROM_ADDR_WPM, (uint8_t)wpm); EEPROM.commit(); EEPROM.end();
+      }
+      memmove(usbRxBuf, usbRxBuf+2, usbRxLen-2);
+      usbRxLen -= 2;
+    }
+    // パドル左右入替パケット (0xE3) - SYNC前でも受信できるよう早めに処理
+    if (usbRxLen >= 2 && usbRxBuf[0] == 0xE3) {
+      bool newSwap = (usbRxBuf[1] == 0x01);
+      if (newSwap != paddleSwapped) {
+        paddleSwapped = newSwap;
+        EEPROM.begin(EEPROM_SIZE); EEPROM.write(EEPROM_ADDR_PADDLE_SWAP, paddleSwapped ? 1 : 0); EEPROM.commit(); EEPROM.end();
+      }
+      memmove(usbRxBuf, usbRxBuf+2, usbRxLen-2);
+      usbRxLen -= 2;
+    }
+
+    if (!timeSynced) {
+      if (syncCollecting && syncSampleIndex > 0) {
+        // 0xE1受信中: 両LED オレンジ点滅 (200ms)
+        bool blink = (nowMillis / 200) % 2;
+        fill_solid(g_keyLeds, NUM_KEY_LEDS, blink ? CRGB(255, 120, 0) : CRGB::Black);
+      } else if (Serial) {
+        // アプリ接続済み・待機中: 両LED 黄色点滅 (500ms)
+        bool blink = (nowMillis / 500) % 2;
+        fill_solid(g_keyLeds, NUM_KEY_LEDS, blink ? CRGB(255, 255, 0) : CRGB::Black);
+      } else {
+        // アプリ未接続: 右(DIT)赤点滅 (1000ms)
+        bool blink = (nowMillis / 1000) % 2;
+        g_keyLeds[0] = CRGB::Black;
+        g_keyLeds[1] = blink ? CRGB(255, 0, 0) : CRGB::Black;
+      }
+      FastLED.show();
+      yield();
+      return;
+    }
+
+    // イベント駆動 イアンビック・キーヤー
+    { KeyEvt e; while ((e = popEvt()) != KEVT_NONE) processKeyerEvent(e, millis()); }
+    // IDLE時に既押下状態を検知 (イベントロスト/バウンスフォールバック)
+    if (keyerState == KEYER_IDLE && timeSynced) {
+      bool dit, dah; readPaddles(dit, dah);
+      if (dit || dah) processKeyerEvent(dah ? KEVT_DAH_DN : KEVT_DIT_DN, millis());
+    }
+
+    // キーON安全タイムアウト (millis()を直接使用: nowMillisはloop先頭でキャプチャのためlastOnMillisより古い場合アンダーフローする)
+    if (currentKeyState && millis() - lastOnMillis > MAX_ON_DURATION) {
+      sendKeyEvent(false, millis());
+      keyerState = KEYER_IDLE;
+    }
+
+    // LED を keyer 実行後に一括更新 (g_keyLeds[] 変更時のみ show → RMT DMA過負荷防止)
+    if (ledDirty) { FastLED.show(); ledDirty = false; }
+
+    yield();
+    return;
+  }  // end USB-CDC block
+
+  // ---- 以下: WiFi モード & USB-NCM モード (共通 UDP 処理) -------------------
+  // USB-NCM モードでは serverIP = NCM_HOST_IP (iOS/Android 中継アプリ)
+  // WiFi モードでは serverIP = Server の IP
+  // どちらも WiFiUDP Udp で透過的に動作 (lwIP がルーティング)
+
+  // SYNC 収集中かつ接続あり
+  static bool syncRequested = false;
+  static unsigned long lastSyncRetryMillis = 0;
+
+  bool isConnected;
+#if HAS_USBNCM
+  isConnected = (usbMode && ncmMode) ? (bool)ncm : (WiFi.status() == WL_CONNECTED);
+#else
+  isConnected = (WiFi.status() == WL_CONNECTED);
+#endif
+
+  if (!timeSynced && isConnected) {
+    if (!syncRequested || millis() - lastSyncRetryMillis >= 2000) {
+      requestMillisSync();
+      syncRequested   = true;
+      syncCollecting  = true;
+      syncSampleIndex = 0;
+      lastSyncRetryMillis = millis();
+    }
+  }
+
+  // イベント駆動 イアンビック・キーヤー (WiFi/NCMモード)
+  { KeyEvt e; while ((e = popEvt()) != KEVT_NONE) processKeyerEvent(e, millis()); }
+  if (keyerState == KEYER_IDLE && timeSynced) {
+    bool dit, dah; readPaddles(dit, dah);
+    if (dit || dah) processKeyerEvent(dit ? KEVT_DIT_DN : KEVT_DAH_DN, millis());
+  }
+
+  // サンプリング送信 (キーヤー出力状態を使用)
+  if (timeSynced && millis() - lastSampleTimeMs >= SAMPLE_INTERVAL_MS) {
+    lastSampleTimeMs = millis();
+    bool down = currentKeyState;
+    if (sampleIndex == 0) { sampleStartTimeMs = millis(); keyBuf = 0; }
+    sampleTimes[sampleIndex] = millis();
+    if (down) keyBuf |= (1 << sampleIndex);
+    sampleIndex++;
+    if (sampleIndex >= SAMPLE_SEND_AMNT) {
+      byte pkt[21];
+      pkt[0] = trxCode; pkt[1] = keyBuf;
+      pkt[2] = (sampleStartTimeMs>>16)&0xFF;
+      pkt[3] = (sampleStartTimeMs>>8)&0xFF;
+      pkt[4] =  sampleStartTimeMs&0xFF;
+      for (int i = 0; i < SAMPLE_SEND_AMNT; i++)
+        pkt[5+i] = (byte)constrain(sampleTimes[i]-sampleStartTimeMs, 0, 255);
+      for (int i = 0; i < SAMPLE_SEND_DUP_CNT; i++) {
+        Udp.beginPacket(serverIP, SERVER_PORT);
+        Udp.write(pkt, 5+SAMPLE_SEND_AMNT);
+        Udp.endPacket();
+        taskYIELD();
+      }
+      sampleIndex = 0;
+    }
+  }
+
+  // UDP 受信
+  if (isConnected) {
+    int size = Udp.parsePacket();
+    if (size > 0) {
+      byte buf[12];
+      int len = Udp.read(buf, size);
+
+      if (size == 9 && buf[0] == 0xE1) {
+        uint32_t serverRecvMs = 0;
+        for (int i = 4; i < 8; i++) serverRecvMs = (serverRecvMs<<8)|buf[1+i];
+        int64_t offset = (int64_t)serverRecvMs - (int64_t)(uint32_t)nowMillis;
+
+        if (syncCollecting) {
+          if (syncSampleIndex < SYNC_SAMPLE_COUNT) syncOffsets[syncSampleIndex++] = offset;
+          if (syncSampleIndex >= SYNC_SAMPLE_COUNT) {
+            int64_t minOff = syncOffsets[0];
+            for (int i = 1; i < SYNC_SAMPLE_COUNT; i++)
+              if (syncOffsets[i] < minOff) minOff = syncOffsets[i];
+            delayOffsetMs  = minOff;
+            timeSynced     = true;
+            syncCollecting = false;
+            fixedDelayLocked   = true;
+            fixedDelayLockUntil = millis() + 30000;
+            blinkInterval  = BLINK_INTERVAL_SYNC;
+            rttIndex = 0;
+            for (int i = 0; i < RTT_HISTORY_SIZE; i++) rttHistory[i] = 0;
+            sampleIndex = 0; keyBuf = 0;
+            lastSampleTimeMs    = millis();
+            lastSyncRequestMillis = millis();
+            lastSyncRetryMillis   = millis();
+            setLedColorFromProfile(&RedProfile); delay(100);
+            currentKeyState ? setLedColorFromProfile(&GreenProfile) : clearLed();
+          } else {
+            requestMillisSync();
+            lastSyncRetryMillis = millis();
+          }
+          return;
+        }
+
+        delayOffsetMs    = offset;
+        timeSynced       = true;
+        fixedDelayMs     = usbMode ? 100 : rttToDelayMs(pingRttMs);
+        fixedDelayLocked = true;
+        fixedDelayLockUntil = millis() + 30000;
+        lastPingMillis   = nowMillis;
+        lastPingSendMillis = nowMillis;
+        blinkInterval    = BLINK_INTERVAL_SYNC;
+        rttIndex = 0;
+        for (int i = 0; i < RTT_HISTORY_SIZE; i++) rttHistory[i] = 0;
+        sampleIndex = 0; keyBuf = 0;
+        lastSampleTimeMs     = nowMillis;
+        lastSyncRequestMillis = nowMillis;
+        lastSyncRetryMillis   = nowMillis;
+        setLedColorFromProfile(&RedProfile); delay(100);
+        currentKeyState ? setLedColorFromProfile(&GreenProfile) : clearLed();
+      }
+      else if (size == 1 && buf[0] == 0xFE) {
+        pongReceived = true;
+        long rtt = nowMillis - lastPingSendMillis;
+        rttHistory[rttIndex] = rtt;
+        rttIndex = (rttIndex+1) % RTT_HISTORY_SIZE;
+        pingRttMs = getAverageRtt();
+        if (!fixedDelayLocked && !currentKeyState && (millis()-lastOnMillis > 1000)) {
+          fixedDelayMs     = rttToDelayMs(pingRttMs);
+          fixedDelayLocked = true;
+        }
+        lastPingMillis = nowMillis;
+      }
+      else if (size == 2 && buf[0] == 0xE2) {
+        // WPMパケット: byte[1]=WPM値 (5-99)
+        int newWpm = buf[1];
+        if (newWpm >= 5 && newWpm <= 99) wpm = newWpm;
+      }
+    }
+  }
+
+  // PING 送信
+  if (timeSynced && nowMillis - lastPingSendMillis > PING_INTERVAL) {
+    if (!pongReceived && !currentKeyState) lostPingCount++;
+    else if (currentKeyState)             lostPingCount = 0;
+    pongReceived = false;
+    byte ping = 0xFF;
+    Udp.beginPacket(serverIP, SERVER_PORT);
+    Udp.write(&ping, 1);
+    Udp.endPacket();
+    lastPingSendMillis = nowMillis;
+  }
+
+  // RTT 再計算
+  if (timeSynced && nowMillis - lastDelayRecalcMillis >= ReCal_RTT) {
+    lastDelayRecalcMillis = nowMillis;
+    pingRttMs = getAverageRtt();
+    if (!fixedDelayLocked) fixedDelayMs = rttToDelayMs(pingRttMs);
+  }
+
+  // タイムアウト検出
+  if (timeSynced && nowMillis - lastPingMillis >= dynamicTimeout) {
+    timeSynced       = false;
+    blinkInterval    = BLINK_INTERVAL_WIFI;
+    fixedDelayLocked = false;
+    keyerState = KEYER_IDLE;
+  }
+
+  if (timeSynced && !currentKeyState && (millis()-lastOnMillis >= 5000))
+    fixedDelayLocked = false;
+
+  // LED 点滅
+  if (nowMillis - lastBlinkMillis >= blinkInterval) {
+    ledState = !ledState;
+    ledState ? setLedColorFromProfile(&GreenProfile) : clearLed();
+    lastBlinkMillis = nowMillis;
+  }
+
+  // WiFi 切断検出 (WiFi モードのみ)
+  if (!usbMode && WiFi.status() != WL_CONNECTED) {
+    timeSynced       = false;
+    blinkInterval    = BLINK_INTERVAL_WIFI;
+    fixedDelayLocked = false;
+    static unsigned long lastReconnectMs = 0;
+    if (nowMillis - lastReconnectMs >= 30000) {
+      lastReconnectMs = nowMillis;
+      WiFiProfile &rp = wifiProfiles[activeProfileIndex];
+      WiFi.begin(rp.ssid, rp.password);
+    }
+  }
+
+  // SYNC 再送
+  if (!timeSynced && isConnected && millis()-lastSyncRetryMillis >= 5000) {
+    syncCollecting  = true;
+    syncSampleIndex = 0;
+    requestMillisSync();
+    lastSyncRetryMillis = millis();
+  }
+  if (!timeSynced) return;
+
+  // ON 安全対策 (millis()を直接使用: nowMillisはloop先頭でキャプチャのためアンダーフローする場合あり)
+  if (currentKeyState && millis() - lastOnMillis > MAX_ON_DURATION) {
+    sendKeyEvent(false, millis());
+    keyerState = KEYER_IDLE;
+  }
+
+  if (fixedDelayLocked && millis() > fixedDelayLockUntil) fixedDelayLocked = false;
+
+  delay(1);
+}
+
+// =============================================================================
+// BLE 初期化 (Nordic UART Service)
+// =============================================================================
+void initBluetooth() {
+  BLEDevice::init("DualKey-BLE");
+  BLESecurity::setAuthenticationMode(false, false, false);  // ボンディング不要: 再ペアリング不要で接続可能
+  BLESecurity::resetSecurity();                             // 旧ボンド情報をクリア
+  g_bleServer = BLEDevice::createServer();
+  g_bleServer->setCallbacks(new BleSrvCallbacks());
+
+  BLEService *nus = g_bleServer->createService(NUS_SERVICE_UUID);
+
+  g_bleTxChar = nus->createCharacteristic(
+    NUS_TX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY);
+
+  BLECharacteristic *rxChar = nus->createCharacteristic(
+    NUS_RX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rxChar->setCallbacks(new BleRxCallbacks());
+
+  nus->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE_UUID);
+  adv->setScanResponse(false);
+  BLEDevice::startAdvertising();
+}
+
+// =============================================================================
+// WiFi 接続
+// =============================================================================
+bool connectToWiFi() {
+  WiFiProfile &profile = wifiProfiles[activeProfileIndex];
+  if (!profile.isApMode && profile.hostname && strlen(profile.hostname) > 0)
+    WiFi.setHostname(profile.hostname);
+  if (profile.hasIP)
+    WiFi.config(profile.localIP, profile.gateway, profile.subnet);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.begin(profile.ssid, profile.password);
+  if (profile.isApMode) esp_wifi_set_max_tx_power(84);
+  for (int t = 0; t < 60; t++) {
+    if (WiFi.status() == WL_CONNECTED) {
+      serverIP = profile.serverIP;
+      dynamicTimeout = DEFAULT_TIMEOUT;
+      return true;
+    }
+    delay(500);
+  }
+  return false;
+}
+
+// =============================================================================
+// SYNC 要求
+// =============================================================================
+void requestMillisSync() {
+  lastSyncRequestMillis = millis();
+  lastPingSendMillis    = lastSyncRequestMillis;
+  byte pkt[5] = {
+    0xE0,
+    (byte)((lastSyncRequestMillis>>24)&0xFF),
+    (byte)((lastSyncRequestMillis>>16)&0xFF),
+    (byte)((lastSyncRequestMillis>>8)&0xFF),
+    (byte)( lastSyncRequestMillis&0xFF)
+  };
+  Udp.beginPacket(serverIP, SERVER_PORT);
+  Udp.write(pkt, 5);
+  Udp.endPacket();
+}
+
+// =============================================================================
+// キーパケット送信
+// =============================================================================
+void sendKeyPacket(bool isOn, byte trxSel, uint64_t opTimeMs) {
+  byte pkt[10];
+  pkt[0] = isOn ? 0x01 : 0x00;
+  pkt[1] = trxSel;
+  for (int i = 0; i < 8; i++) pkt[2+i] = (opTimeMs>>(56-i*8))&0xFF;
+  for (int i = 0; i < keyRepeatCount; i++) {
+    if (!Udp.beginPacket(serverIP, SERVER_PORT)) return;
+    Udp.write(pkt, 10);
+    Udp.endPacket();
+    taskYIELD();
+  }
+  isOn ? setLedColorFromProfile(&RedProfile) : clearLed();
+}
+
+void flashRedBeforeRestart() {
+  for (int i = 0; i < 3; i++) {
+    setLedColorFromProfile(&RedProfile); delay(100);
+    clearLed(); delay(100);
+  }
+}
+
+// =============================================================================
+// mDNS サーバー IP 解決
+// =============================================================================
+void getserverIP() {
+  WiFiProfile &profile = wifiProfiles[activeProfileIndex];
+  if (!profile.hasIP && profile.serverhostname && strlen(profile.serverhostname) > 0) {
+    if (!MDNS.begin(profile.hostname)) return;
+    String hostname = profile.serverhostname;
+    delay(1000);
+    if (!hostname.endsWith(".local")) hostname += ".local";
+    String queryName = hostname; queryName.replace(".local", "");
+    IPAddress resolved;
+    for (int i = 0; i < HOSTNAME_RESTIME; i++) {
+      resolved = MDNS.queryHost(queryName);
+      if (resolved != INADDR_NONE) break;
+      delay(1000);
+    }
+    if (resolved != INADDR_NONE) serverIP = resolved;
+  } else {
+    serverIP = profile.serverIP;
+  }
+}
+
+// =============================================================================
+// LED
+// =============================================================================
+void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  fill_solid(g_keyLeds, NUM_KEY_LEDS, CRGB(r, g, b));
+  FastLED.show();
+}
+void setLedColorFromProfile(ColorProfile *color) {
+  if (!color) return; setLedColor(color->r, color->g, color->b);
+}
+void flashLedProfile(ColorProfile *color, int durationMs, int repeat) {
+  if (!color) return;
+  for (int i = 0; i < repeat; i++) {
+    setLedColorFromProfile(color); delay(durationMs);
+    setLedColor(0,0,0);            delay(durationMs);
+  }
+}
+void flashOnce(ColorProfile *color, int durationMs) {
+  if (!color) return;
+  setLedColorFromProfile(color); delay(durationMs); setLedColor(0,0,0);
+}
+void initLed() {
+  static bool ready = false;
+  if (!ready) {
+    // G40: WS2812B 電源制御 — HIGH で LED に電源供給
+    pinMode(LED_PWR_PIN, OUTPUT);
+    digitalWrite(LED_PWR_PIN, HIGH);
+    FastLED.addLeds<WS2812B, LED_DATA_PIN, GRB>(g_keyLeds, NUM_KEY_LEDS);
+    FastLED.setBrightness(80);
+    ready = true;
+  }
+  fill_solid(g_keyLeds, NUM_KEY_LEDS, CRGB::Black);
+  FastLED.show();
+}
+void setLedFromProfileIndex(int index) {
+  if (index >= 0 && index < profileCount)
+    setLedColorFromProfile(wifiProfiles[index].color);
+}
+void clearLed() {
+  fill_solid(g_keyLeds, NUM_KEY_LEDS, CRGB::Black);
+  FastLED.show();
+}
+
+// =============================================================================
+// EEPROM
+// =============================================================================
+void saveProfileIndexToEEPROM(int index) {
+  EEPROM.write(EEPROM_ADDR_PROFILE_INDEX, index); EEPROM.commit();
+}
+int loadProfileIndexFromEEPROM() {
+  byte val = EEPROM.read(EEPROM_ADDR_PROFILE_INDEX);
+  return (val < MAX_WIFI_PROFILES) ? val : 0;
+}
+
+void saveWiFiProfileToEEPROM(const WiFiProfile &src, int index) {
+  if (!src.ssid || strlen(src.ssid)==0) return;
+  WiFiProfileEEPROM dst; memset(&dst, 0, sizeof(dst));
+  dst.magic = PROFILE_MAGIC;
+  strncpy(dst.ssid,     src.ssid,     MAX_SSID_LEN);
+  strncpy(dst.password, src.password, MAX_PASS_LEN);
+  if (src.hostname)       strncpy(dst.hostname,       src.hostname,       MAX_HOSTNAME_LEN);
+  if (src.serverhostname) strncpy(dst.serverhostname, src.serverhostname, MAX_HOSTNAME_LEN);
+  for (int i=0;i<4;i++) {
+    dst.localIP[i]=src.localIP[i]; dst.gateway[i]=src.gateway[i];
+    dst.subnet[i]=src.subnet[i];   dst.serverIP[i]=src.serverIP[i];
+  }
+  dst.isApMode = src.isApMode; dst.hasIP = src.hasIP;
+  if      (src.color==&cyanProfile)    dst.colorId=0;
+  else if (src.color==&MagentaProfile) dst.colorId=1;
+  else if (src.color==&yellowProfile)  dst.colorId=2;
+  else if (src.color==&RedProfile)     dst.colorId=3;
+  else if (src.color==&BlueProfile)    dst.colorId=4;
+  else if (src.color==&GreenProfile)   dst.colorId=5;
+  else if (src.color==&WhiteProfile)   dst.colorId=6;
+  else                                 dst.colorId=0;
+  EEPROM.put(EEPROM_ADDR_PROFILE_BASE + index*sizeof(WiFiProfileEEPROM), dst);
+  EEPROM.commit();
+}
+
+bool loadWiFiProfileFromEEPROM(WiFiProfile &dst, int index) {
+  WiFiProfileEEPROM raw;
+  EEPROM.get(EEPROM_ADDR_PROFILE_BASE + index*sizeof(WiFiProfileEEPROM), raw);
+  if (raw.magic != PROFILE_MAGIC) return false;
+  freeWiFiProfileStrings(dst);
+  dst.ssid     = strdup(raw.ssid);
+  dst.password = strdup(raw.password);
+  dst.localIP  = IPAddress(raw.localIP);
+  dst.gateway  = IPAddress(raw.gateway);
+  dst.subnet   = IPAddress(raw.subnet);
+  dst.serverIP = IPAddress(raw.serverIP);
+  dst.isApMode = raw.isApMode; dst.hasIP = raw.hasIP;
+  dst.hostname       = strdup(raw.hostname);
+  dst.serverhostname = strdup(raw.serverhostname);
+  const ColorProfile *tbl[] = {&cyanProfile,&MagentaProfile,&yellowProfile,
+                                &RedProfile, &BlueProfile,   &GreenProfile, &WhiteProfile};
+  dst.color = (raw.colorId < 7) ? const_cast<ColorProfile*>(tbl[raw.colorId]) : &RedProfile;
+  return true;
+}
+
+void clearEEPROM() {
+  for (int i=0;i<EEPROM_SIZE;i++) EEPROM.write(i,0xFF);
+  EEPROM.commit(); delay(100);
+}
+
+bool restoreProfilesFromEEPROM() {
+  profileCount = 0;
+  for (int i=0;i<MAX_WIFI_PROFILES;i++)
+    if (loadWiFiProfileFromEEPROM(wifiProfiles[i],i)) profileCount++;
+  return profileCount > 0;
+}
+
+void saveSystemSettingsToEEPROM(const SystemSettingsEEPROM &s) {
+  EEPROM.put(EEPROM_ADDR_SETTINGS, s); EEPROM.commit();
+}
+bool loadSystemSettingsFromEEPROM(SystemSettingsEEPROM &s) {
+  EEPROM.get(EEPROM_ADDR_SETTINGS, s);
+  return s.magic == 0xA5;
+}
